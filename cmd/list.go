@@ -46,7 +46,7 @@ var listCmd = &cobra.Command{
 			return nil
 		}
 
-		table := ui.NewTable("NAME", "IMAGE", "STATE", "ID")
+		table := ui.NewTable("NAME", "IMAGE", "STATE", "NETWORK", "TYPE", "ID")
 		for _, c := range list {
 			name := ""
 			if len(c.Names) > 0 {
@@ -57,7 +57,27 @@ var listCmd = &cobra.Command{
 			if len(shortID) > 12 {
 				shortID = shortID[:12]
 			}
-			table.AddRow(name, c.Image, ui.StateColor(c.State), shortID)
+			
+			network := string(config.NetworkBridge)
+			contype := "podman"
+
+			if len(c.Networks) > 0 {
+				switch c.Networks[0] {
+				case string(config.NetworkHost):
+					network = string(config.NetworkHost)
+				case string(config.NetworkNone), "":
+					network = string(config.NetworkNone)
+				case string(config.NetworkSlirp):
+					network = string(config.NetworkSlirp)
+				default:
+					network = string(config.NetworkBridge)
+				}
+				// docker containers ont un réseau préfixé par le nom du projet
+				if c.Labels["io.podman.compose.project"] == "" && c.Labels["com.docker.compose.project"] != "" {
+					contype = "docker"
+				}
+			}
+			table.AddRow(name, c.Image, ui.StateColor(c.State), network, contype, shortID)
 		}
 		table.Render()
 

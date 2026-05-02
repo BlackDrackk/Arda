@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-
 	"github.com/BurntSushi/toml"
 )
 

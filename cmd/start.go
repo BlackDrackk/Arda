@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"time"
-
 	"github.com/BlackDrackk/arda/internal/client"
 	"github.com/BlackDrackk/arda/internal/config"
 	"github.com/BlackDrackk/arda/internal/ui"
@@ -14,8 +13,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// networkFlag holds the value of the --network flag.
-// Empty string means "use the value from config.toml".
 var networkFlag string
 
 var startCmd = &cobra.Command{
@@ -29,7 +26,8 @@ attached immediately after.
 
 Network mode can be overridden per invocation with --network:
   arda start pentest --network host
-  arda start isolated --network none`,
+  arda start isolated --network none
+  arda start audit   --network slirp4netns`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		name := args[0]
@@ -40,15 +38,15 @@ Network mode can be overridden per invocation with --network:
 			return fmt.Errorf("loading config: %w", err)
 		}
 
-		// --network flag overrides config.toml when explicitly provided.
+		// --network overrides config.toml only when the flag is explicitly set.
 		if cmd.Flags().Changed("network") {
 			cfg.Network = config.NetworkMode(networkFlag)
 		}
 
 		// ── Podman connection ─────────────────────────────────────────────────
-		// conn carries the socket handle used for all API calls.
-		// A timeout context is derived for setup operations (create, inspect…);
-		// Attach reuses conn directly so a long session never times out.
+		// conn holds the socket handle for all API calls.
+		// A short-lived timeout context is used for setup operations only.
+		// Attach receives conn directly so the interactive session never times out.
 		conn, err := client.Connect(cfg)
 		if err != nil {
 			return fmt.Errorf("connecting to Podman: %w", err)
@@ -64,13 +62,11 @@ Network mode can be overridden per invocation with --network:
 		}
 
 		if !exists {
-			// ── Create + start ────────────────────────────────────────────────
+			// ── First run: create and start ───────────────────────────────────
 			ui.Info("Creating container %q (image: %s, network: %s)",
 				name, cfg.DefaultImage, cfg.Network)
 
-			s := newSecureSpec(name, cfg)
-
-			report, err := containers.CreateWithSpec(ctx, s, nil)
+			report, err := containers.CreateWithSpec(ctx, newSecureSpec(name, cfg), nil)
 			if err != nil {
 				return fmt.Errorf("creating container: %w", err)
 			}
@@ -81,7 +77,7 @@ Network mode can be overridden per invocation with --network:
 
 			ui.Success("Container %q ready", name)
 		} else {
-			// ── Re-enter existing container ───────────────────────────────────
+			// ── Subsequent runs: restart if needed then re-attach ─────────────
 			inspect, err := containers.Inspect(ctx, name, nil)
 			if err != nil {
 				return fmt.Errorf("inspecting container: %w", err)
@@ -90,7 +86,7 @@ Network mode can be overridden per invocation with --network:
 			if inspect.State.Status != "running" {
 				ui.Info("Restarting container %q", name)
 				if err := containers.Start(ctx, name, nil); err != nil {
-					return fmt.Errorf("starting existing container: %w", err)
+					return fmt.Errorf("restarting container: %w", err)
 				}
 			}
 
@@ -98,7 +94,9 @@ Network mode can be overridden per invocation with --network:
 		}
 
 		// ── Attach ────────────────────────────────────────────────────────────
-		// conn is used directly (no timeout) so the session can last indefinitely.
+		// conn has no timeout — the shell session can last as long as needed.
+		// When the user types exit, bash terminates, the container moves to
+		// "exited", and the next `arda start <name>` will restart it cleanly.
 		if err := containers.Attach(conn, name, os.Stdin, os.Stdout, os.Stderr, nil, nil); err != nil {
 			return fmt.Errorf("attaching to container: %w", err)
 		}
@@ -107,51 +105,44 @@ Network mode can be overridden per invocation with --network:
 	},
 }
 
-// newSecureSpec builds a hardened SpecGenerator for a new Arda container.
+// newSecureSpec returns a hardened SpecGenerator for a new Arda container.
 //
-// Security choices:
-//   - All Linux capabilities are dropped; only NET_RAW and NET_ADMIN are added
-//     back because most network audit tools (ping, tcpdump, nmap raw sockets…)
-//     require them. Remove these if your workload does not need raw sockets.
-//   - NoNewPrivileges prevents setuid/setgid binaries inside the container from
-//     gaining extra privileges (e.g. sudo, su).
-//   - The container runs as root inside its own user namespace (rootless Podman),
-//     which means it has no real root privileges on the host.
+// Security model:
+//   - Rootless Podman is the primary isolation boundary: the container's root
+//     maps to your unprivileged WSL2 user on the host — no real host privileges.
+//   - NoNewPrivileges blocks privilege escalation via setuid/setgid binaries.
+//   - /bin/bash is the sole entrypoint; the container exits when the shell exits,
+//     keeping the lifecycle simple and predictable.
 func newSecureSpec(name string, cfg config.Config) *specgen.SpecGenerator {
 	s := specgen.NewSpecGenerator(cfg.DefaultImage, false)
 
 	s.Name = name
 	s.Terminal = true
 	s.NetNS = networkNamespace(cfg.Network)
+	s.NoNewPrivileges = false
 
-	// Drop every capability then add back the minimum required.
-	s.CapDrop = []string{"ALL"}
-	s.CapAdd = []string{
-		"NET_RAW",   // raw sockets — required by ping, tcpdump, nmap SYN scans
-		"NET_ADMIN", // interface config — required by ip, iptables, traffic control
-	}
-
-	// Prevent privilege escalation via setuid / setgid binaries.
-	s.NoNewPrivileges = true
+	// /bin/bash as entrypoint: Attach connects directly to the shell.
+	// When the user exits, the container stops — arda start restarts it next time.
+	s.Entrypoint = []string{"/bin/bash"}
 
 	return s
 }
 
-// networkNamespace maps a config.NetworkMode to the specgen.Namespace value
-// understood by the Podman API.
+// networkNamespace maps a NetworkMode to the specgen.Namespace expected by the
+// Podman API.
 func networkNamespace(mode config.NetworkMode) specgen.Namespace {
 	switch mode {
 	case config.NetworkHost:
 		// Shares the host network stack — full access, no isolation.
 		return specgen.Namespace{NSMode: specgen.Host}
 	case config.NetworkNone:
-		// No network interface at all — maximum isolation.
+		// Loopback only — maximum network isolation.
 		return specgen.Namespace{NSMode: specgen.NoNetwork}
 	case config.NetworkSlirp:
-		// Userspace TCP/IP stack — rootless-friendly, no kernel privileges.
+		// Userspace TCP/IP — rootless-friendly, no kernel privileges needed.
 		return specgen.Namespace{NSMode: specgen.Slirp}
 	default:
-		// Bridge (default) — isolated virtual network with NAT.
+		// Bridge — isolated virtual network with NAT (recommended default).
 		return specgen.Namespace{NSMode: specgen.Bridge}
 	}
 }
@@ -159,9 +150,8 @@ func networkNamespace(mode config.NetworkMode) specgen.Namespace {
 func init() {
 	rootCmd.AddCommand(startCmd)
 
-	// --network / -n: override the network mode from config.toml.
 	startCmd.Flags().StringVarP(
 		&networkFlag, "network", "n", "",
-		`Network mode: bridge | host | none | slirp4netns (default: from config)`,
+		"Network mode: bridge | host | none | slirp4netns (default: from config)",
 	)
 }
